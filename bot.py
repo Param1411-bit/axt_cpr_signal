@@ -1,32 +1,31 @@
 """
-AxT CPR signal relay  —  TradingView → (filter) → Telegram group
+AxT CPR signal relay  v2  —  TradingView -> (filter) -> Telegram group
 
-What it does
-------------
-* TradingView fires EVERY signal to  POST /tv/<TV_SECRET>  with body {"slot":N,"text":"..."}
-* This bot checks slot N's ON/OFF state (stored in Redis) and:
-      - forwards the message to your group if the slot is ON
-      - drops it silently if the slot is OFF
-* You DM the bot  /alerts  → six tappable buttons (✅/⬜) to flip slots on/off.
-  Changes apply instantly. You NEVER touch TradingView again to mute a slot.
+Adds on top of v1:
+  * Per-ASSET on/off toggles (BTC, ETH, SOL, XAU, XAG)
+  * A 30-minute FRESHNESS WINDOW: a signal is only forwarded if it arrives
+    within WINDOW_MIN minutes of that asset's scheduled entry time. Late = dropped.
 
-Why Redis: Railway restarts the process on every deploy. In-memory state would
-reset to all-ON silently. Redis keeps the six toggles across restarts.
+Scheduled entry times (IST), by asset group:
+    crypto (BTC/ETH/SOL): 09:30, 13:30, 17:30, 21:30
+    metals (XAU/XAG):     10:30, 14:30, 18:30, 22:30
+The signal's scheduled slot is inferred from its ARRIVAL time (no Pine change
+needed): we take the most recent scheduled time at/before arrival for that asset
+group; if arrival is more than WINDOW_MIN minutes past it, the signal is stale.
 
-Env vars (set in Railway → Variables):
-    BOT_TOKEN     your bot token from @BotFather
-    ADMIN_ID      your Telegram numeric id (from @userinfobot) — only you can toggle
-    TARGET_CHAT   the group id, e.g. -1002268449482
-    REDIS_URL     provided automatically by the Railway Redis add-on
-    TV_SECRET     any random string — becomes part of the /tv/<...> path
-    TG_SECRET     any random string — becomes part of the Telegram webhook path
-    PUBLIC_URL    (optional) https://your-app.up.railway.app
-                  If omitted, the bot uses Railway's RAILWAY_PUBLIC_DOMAIN.
+Controls (DM the bot, admin only):  /alerts
+Redis holds all state so it survives Railway restarts.
+
+Env vars (Railway -> Variables):
+    BOT_TOKEN, ADMIN_ID, TARGET_CHAT, REDIS_URL, TV_SECRET, TG_SECRET
+    PUBLIC_URL   (or Railway's RAILWAY_PUBLIC_DOMAIN)
+    WINDOW_MIN   (optional, default 30)
 """
 
 import os
 import json
 import logging
+from datetime import datetime, timedelta, timezone
 
 import redis
 import requests
@@ -34,9 +33,10 @@ from flask import Flask, request
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("relay")
+IST = timezone(timedelta(hours=5, minutes=30))
 
 
-# ── config ────────────────────────────────────────────────────────────────
+# --- config ---------------------------------------------------------------
 def _req(name):
     v = os.environ.get(name)
     if not v:
@@ -49,6 +49,7 @@ TARGET_CHAT = _req("TARGET_CHAT")
 REDIS_URL   = _req("REDIS_URL")
 TV_SECRET   = os.environ.get("TV_SECRET", "tv-change-me")
 TG_SECRET   = os.environ.get("TG_SECRET", "tg-change-me")
+WINDOW_MIN  = int(os.environ.get("WINDOW_MIN", "30"))
 
 PUBLIC_URL = os.environ.get("PUBLIC_URL")
 if not PUBLIC_URL:
@@ -58,65 +59,117 @@ PUBLIC_URL = PUBLIC_URL.rstrip("/")
 
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# display labels only — the actual slot is decided in Pine and sent in the payload
-SLOT_LABELS = {
-    1: "1:30 crypto · 3:30 gold",
-    2: "5:30 crypto · 6:30 gold",
-    3: "9:30 crypto · 10:30 gold",
-    4: "13:30 crypto · 14:30 gold",
-    5: "17:30 crypto · 18:30 gold",
-    6: "21:30 crypto · 22:30 gold",
+
+# --- assets & schedules ---------------------------------------------------
+ASSETS = {
+    "BTC": {"label": "BTC",    "group": "crypto", "match": ("BTC",)},
+    "ETH": {"label": "ETH",    "group": "crypto", "match": ("ETH",)},
+    "SOL": {"label": "SOL",    "group": "crypto", "match": ("SOL",)},
+    "XAU": {"label": "Gold",   "group": "metals", "match": ("XAU", "GOLD")},
+    "XAG": {"label": "Silver", "group": "metals", "match": ("XAG", "SILVER")},
 }
+import datetime as _dt
 
+def _nth_sunday(year, month, n):
+    w = _dt.date(year, month, 1).weekday()      # Mon=0 .. Sun=6
+    first_sun = 1 + (6 - w) % 7
+    return first_sun + (n - 1) * 7
+
+def _us_dst(now_ist):
+    # US daylight time: 2nd Sun March .. 1st Sun November
+    y = now_ist.year
+    start = _dt.date(y, 3, _nth_sunday(y, 3, 2))
+    end   = _dt.date(y, 11, _nth_sunday(y, 11, 1))
+    return start <= now_ist.date() < end
+
+def schedule_for(group, now_ist):
+    if group == "crypto":
+        # Coinbase is UTC-anchored -> fixed year round
+        return [9*60+30, 13*60+30, 17*60+30, 21*60+30]   # 09:30 13:30 17:30 21:30
+    # OANDA metals are NY-session anchored -> shift +1h in US winter
+    if _us_dst(now_ist):
+        return [10*60+30, 14*60+30, 18*60+30, 22*60+30]  # summer 10:30 14:30 18:30 22:30
+    return [11*60+30, 15*60+30, 19*60+30, 23*60+30]      # winter 11:30 15:30 19:30 23:30
+
+def asset_key_from_symbol(sym):
+    s = (sym or "").upper()
+    for key, cfg in ASSETS.items():
+        if any(m in s for m in cfg["match"]):
+            return key
+    return None
+
+
+# --- redis state (fail-OPEN on read errors) -------------------------------
 rdb = redis.from_url(REDIS_URL, decode_responses=True)
-app = Flask(__name__)
 
-
-# ── redis helpers (fail-OPEN: if Redis is down, send rather than silently drop) ──
-def slot_on(n: int) -> bool:
+def _get_bool(key, default=True):
     try:
-        v = rdb.get(f"slot:{n}")
-        return True if v is None else (v == "on")   # default ON
+        v = rdb.get(key)
+        return default if v is None else (v == "on")
     except Exception as e:
-        log.error("redis read failed (%s) — defaulting slot %s to ON", e, n)
-        return True
+        log.error("redis read %s failed (%s) - default %s", key, e, default)
+        return default
 
-def set_slot(n: int, on: bool):
-    rdb.set(f"slot:{n}", "on" if on else "off")
+def asset_on(key):        return _get_bool(f"asset:{key}")
+def set_asset(key, on):   rdb.set(f"asset:{key}", "on" if on else "off")
+def window_on():          return _get_bool("cfg:window", True)
+def set_window(on):       rdb.set("cfg:window", "on" if on else "off")
 
 
-# ── telegram helpers ──────────────────────────────────────────────────────
-def tg(method: str, **params):
+# --- telegram helpers -----------------------------------------------------
+def tg(method, **params):
     try:
         return requests.post(f"{API}/{method}", json=params, timeout=15).json()
     except Exception as e:
         log.error("telegram %s failed: %s", method, e)
         return {"ok": False, "error": str(e)}
 
-def dm_admin(text: str):
+def dm_admin(text):
     tg("sendMessage", chat_id=ADMIN_ID, text=text, disable_web_page_preview=True)
 
 
-# ── control panel (inline keyboard) ───────────────────────────────────────
+# --- freshness check ------------------------------------------------------
+def minutes_late(group, now_ist):
+    now_min = now_ist.hour * 60 + now_ist.minute
+    sched = schedule_for(group, now_ist)
+    earlier = [t for t in sched if t <= now_min]
+    if earlier:
+        t = max(earlier)
+        late = now_min - t
+    else:
+        t = max(sched)               # before first slot today -> yesterday's last
+        late = now_min + (1440 - t)
+    hh, mm = divmod(t, 60)
+    return late, f"{hh:02d}:{mm:02d}"
+
+
+# --- control panel --------------------------------------------------------
 def build_keyboard():
-    rows = []
-    for n in range(1, 7):
-        mark = "✅" if slot_on(n) else "⬜"
-        rows.append([{"text": f"{mark}  {SLOT_LABELS[n]}",
-                      "callback_data": f"toggle:{n}"}])
-    rows.append([{"text": "🔄 Refresh",     "callback_data": "refresh"},
-                 {"text": "All ON",         "callback_data": "all_on"},
-                 {"text": "All OFF",         "callback_data": "all_off"}])
+    rows = [[{"text": "-- Assets --", "callback_data": "noop"}]]
+    for key in ("BTC", "ETH", "SOL", "XAU", "XAG"):
+        mark = "\u2705" if asset_on(key) else "\u2b1c"
+        rows.append([{"text": f"{mark}  {ASSETS[key]['label']}",
+                      "callback_data": f"asset:{key}"}])
+    wmark = "\u2705" if window_on() else "\u2b1c"
+    rows.append([{"text": f"{wmark}  {WINDOW_MIN}-min freshness filter",
+                  "callback_data": "window"}])
+    rows.append([{"text": "Refresh", "callback_data": "refresh"},
+                 {"text": "All ON",  "callback_data": "all_on"},
+                 {"text": "All OFF",  "callback_data": "all_off"}])
     return {"inline_keyboard": rows}
 
 def panel_text():
-    on = [n for n in range(1, 7) if slot_on(n)]
-    return ("<b>📡 Signal slots</b>\n"
-            "Tap a slot to turn it ON/OFF. Applies instantly — no TradingView changes.\n"
-            f"Currently ON: <b>{len(on)}/6</b>")
+    a_on = [ASSETS[k]["label"] for k in ("BTC","ETH","SOL","XAU","XAG") if asset_on(k)]
+    win  = "ON" if window_on() else "OFF"
+    return ("<b>Relay controls</b>\n"
+            "Tap an asset to send/mute it. Applies instantly - no TradingView changes.\n"
+            f"Assets ON: <b>{', '.join(a_on) or 'none'}</b>\n"
+            f"Freshness filter ({WINDOW_MIN} min after scheduled time): <b>{win}</b>")
 
 
-# ── routes ────────────────────────────────────────────────────────────────
+# --- app & routes ---------------------------------------------------------
+app = Flask(__name__)
+
 @app.get("/health")
 def health():
     return "ok", 200
@@ -135,45 +188,45 @@ def tv():
         return "bad json", 400
 
     text = data.get("text", "")
-    try:
-        slot = int(data.get("slot"))
-    except Exception:
-        dm_admin(f"⚠️ Signal with no/invalid slot — dropped:\n{raw[:300]}")
-        return "no slot", 200
+    key = asset_key_from_symbol(text)
+    if key is None:
+        dm_admin(f"Could not identify asset in signal - dropped:\n{text[:200]}")
+        return "unknown asset", 200
 
-    if slot < 1 or slot > 6:
-        dm_admin(f"⚠️ Signal with out-of-range slot {slot} — dropped.")
-        return "bad slot", 200
+    if not asset_on(key):
+        log.info("asset %s OFF - dropped", key)
+        return "asset off", 200
 
-    if not slot_on(slot):
-        log.info("slot %s OFF — dropped", slot)
-        return "dropped", 200
+    if window_on():
+        group = ASSETS[key]["group"]
+        late, sched = minutes_late(group, datetime.now(IST))
+        if late > WINDOW_MIN:
+            log.info("%s stale: %d min past %s - dropped", key, late, sched)
+            return "stale", 200
 
     res = tg("sendMessage", chat_id=TARGET_CHAT, text=text,
              parse_mode="HTML", disable_web_page_preview=True)
     if not res.get("ok"):
-        dm_admin(f"❌ Failed to forward slot {slot} to the group:\n{res}")
+        dm_admin(f"Failed to forward {ASSETS[key]['label']} signal:\n{res}")
         return "forward failed", 200
 
-    log.info("slot %s ON — forwarded", slot)
+    log.info("%s forwarded", key)
     return "sent", 200
 
 @app.post(f"/telegram/{TG_SECRET}")
 def telegram():
     upd = request.get_json(force=True, silent=True) or {}
 
-    # /alerts or /start
     msg = upd.get("message")
     if msg:
         if msg.get("from", {}).get("id") != ADMIN_ID:
-            return "ignored", 200                       # only admin
+            return "ignored", 200
         txt = (msg.get("text") or "").strip()
         if txt.startswith("/alerts") or txt.startswith("/start"):
             tg("sendMessage", chat_id=ADMIN_ID, text=panel_text(),
                parse_mode="HTML", reply_markup=build_keyboard())
         return "ok", 200
 
-    # button taps
     cq = upd.get("callback_query")
     if cq:
         cbid = cq.get("id")
@@ -186,36 +239,43 @@ def telegram():
         mid = m.get("message_id")
 
         note = "Updated"
-        if data.startswith("toggle:"):
-            n = int(data.split(":")[1])
-            set_slot(n, not slot_on(n))
-            note = f"Slot {n} → {'ON' if slot_on(n) else 'OFF'}"
+        if data.startswith("asset:"):
+            k = data.split(":")[1]
+            set_asset(k, not asset_on(k))
+            note = f"{ASSETS[k]['label']} -> {'ON' if asset_on(k) else 'OFF'}"
+        elif data == "window":
+            set_window(not window_on())
+            note = f"Freshness -> {'ON' if window_on() else 'OFF'}"
         elif data == "all_on":
-            for n in range(1, 7): set_slot(n, True)
-            note = "All ON"
+            for k in ASSETS: set_asset(k, True)
+            note = "All assets ON"
         elif data == "all_off":
-            for n in range(1, 7): set_slot(n, False)
-            note = "All OFF"
+            for k in ASSETS: set_asset(k, False)
+            note = "All assets OFF"
+        elif data == "noop":
+            note = " "
 
         tg("answerCallbackQuery", callback_query_id=cbid, text=note)
-        tg("editMessageText", chat_id=chat_id, message_id=mid,
-           text=panel_text(), parse_mode="HTML", reply_markup=build_keyboard())
+        if data != "noop":
+            tg("editMessageText", chat_id=chat_id, message_id=mid,
+               text=panel_text(), parse_mode="HTML", reply_markup=build_keyboard())
         return "ok", 200
 
     return "ok", 200
 
 
-# ── boot: register the Telegram webhook + ping the admin ───────────────────
+# --- boot -----------------------------------------------------------------
 def on_boot():
     if not PUBLIC_URL:
-        log.error("PUBLIC_URL not set and RAILWAY_PUBLIC_DOMAIN missing — "
-                  "cannot register Telegram webhook. Set PUBLIC_URL and redeploy.")
+        log.error("PUBLIC_URL/RAILWAY_PUBLIC_DOMAIN missing - cannot set webhook.")
         return
     hook = f"{PUBLIC_URL}/telegram/{TG_SECRET}"
     res = tg("setWebhook", url=hook, allowed_updates=["message", "callback_query"])
     log.info("setWebhook -> %s : %s", hook, res)
-    on = sorted(n for n in range(1, 7) if slot_on(n))
-    dm_admin(f"✅ Relay online.\nSlots ON: {on}\nSend /alerts to manage.")
+    a_on = [ASSETS[k]["label"] for k in ASSETS if asset_on(k)]
+    dm_admin(f"Relay v2 online.\nAssets ON: {a_on}\n"
+             f"Freshness: {'ON' if window_on() else 'OFF'} ({WINDOW_MIN} min)\n"
+             f"Send /alerts to manage.")
 
 on_boot()
 
