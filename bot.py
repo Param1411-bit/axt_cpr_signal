@@ -74,6 +74,12 @@ ASSETS = {
 }
 ORDER = ("BTC", "ETH", "SOL", "XAU", "XAG")
 
+# probability label per slot index (0..3) - same order for both groups
+PROB = ["\U0001F7E2 Low probability trade",
+        "\U0001F7E1 Medium probability trade",
+        "\U0001F7E0 High probability trade",
+        "\U0001F534 Extremely high probability trade"]
+
 def _nth_sunday(year, month, n):
     w = _dt.date(year, month, 1).weekday()      # Mon=0 .. Sun=6
     return 1 + (6 - w) % 7 + (n - 1) * 7
@@ -212,7 +218,12 @@ def tv():
         log.info("%s slot %s (%s) OFF - dropped", key, idx, sched)
         return "slot off", 200
 
-    res = tg("sendMessage", chat_id=TARGET_CHAT, text=text,
+    # append probability label (keyed to the slot index, DST-safe)
+    out_text = text
+    if 0 <= idx < len(PROB):
+        out_text = text + "\n" + PROB[idx]
+
+    res = tg("sendMessage", chat_id=TARGET_CHAT, text=out_text,
              parse_mode="HTML", disable_web_page_preview=True)
     if not res.get("ok"):
         dm_admin(f"Failed to forward {ASSETS[key]['label']} {sched} signal:\n{res}")
