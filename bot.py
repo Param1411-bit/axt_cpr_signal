@@ -141,6 +141,10 @@ def slot_on(asset, idx):        return _get_bool(f"slot:{asset}:{idx}")
 def set_slot(asset, idx, on):   rdb.set(f"slot:{asset}:{idx}", "on" if on else "off")
 def window_on():                return _get_bool("cfg:window", True)
 def set_window(on):             rdb.set("cfg:window", "on" if on else "off")
+def india_on():                 return _get_bool("cfg:india", True)   # India group forwarding on/off
+def set_india(on):              rdb.set("cfg:india", "on" if on else "off")
+def india_slot_on(i):           return _get_bool(f"cfg:india:slot:{i}", i == INDIA_SLOT_IDX)  # default: only slot 3 ON
+def set_india_slot(i, on):      rdb.set(f"cfg:india:slot:{i}", "on" if on else "off")
 
 
 # --- telegram helpers -----------------------------------------------------
@@ -174,6 +178,21 @@ def build_keyboard(now_ist):
     wmark = CHK if window_on() else BOX
     rows.append([{"text": f"{wmark} {WINDOW_MIN}-min freshness",
                   "callback_data": "window"}])
+    if INDIA_CHAT:
+        imark = CHK if india_on() else BOX
+        rows.append([{"text": f"{imark} -- India group (master) --",
+                      "callback_data": "india"}])
+        # one on/off per slot for the India group; labels show crypto / metal time
+        c = schedule_for("crypto", now_ist)
+        mt = schedule_for("metals", now_ist)
+        irow = []
+        for i in range(4):
+            ch, cm = divmod(c[i], 60)
+            mh, mm = divmod(mt[i], 60)
+            mark = CHK if india_slot_on(i) else BOX
+            irow.append({"text": f"{mark} {ch:02d}:{cm:02d}/{mh:02d}:{mm:02d}",
+                         "callback_data": f"islot:{i}"})
+        rows.append(irow)
     rows.append([{"text": "Refresh",  "callback_data": "refresh"},
                  {"text": "All ON",   "callback_data": "all_on"},
                  {"text": "All OFF",  "callback_data": "all_off"}])
@@ -182,10 +201,11 @@ def build_keyboard(now_ist):
 def panel_text():
     total = sum(1 for k in ORDER for i in range(4) if slot_on(k, i))
     win = "ON" if window_on() else "OFF"
+    india = ("   |   India: <b>" + ("ON" if india_on() else "OFF") + "</b>") if INDIA_CHAT else ""
     return ("<b>Relay controls</b>\n"
             "Tap a time to send/mute that asset's trade. Tap an asset header to "
             "flip all 4 of its times. Applies instantly - no TradingView changes.\n"
-            f"Trades ON: <b>{total}/20</b>   |   Freshness ({WINDOW_MIN} min): <b>{win}</b>")
+            f"Trades ON: <b>{total}/20</b>   |   Freshness ({WINDOW_MIN} min): <b>{win}</b>{india}")
 
 
 # --- app & routes ---------------------------------------------------------
@@ -239,7 +259,7 @@ def tv():
     log.info("%s slot %s (%s) forwarded", key, idx, sched)
 
     # Extra destination: send the chosen slot to the India community group too.
-    if INDIA_CHAT and idx == INDIA_SLOT_IDX:
+    if INDIA_CHAT and india_on() and india_slot_on(idx):
         r2 = tg("sendMessage", chat_id=INDIA_CHAT, text=out_text,
                 parse_mode="HTML", disable_web_page_preview=True)
         if not r2.get("ok"):
@@ -290,6 +310,13 @@ def telegram():
         elif data == "window":
             set_window(not window_on())
             note = f"Freshness -> {'ON' if window_on() else 'OFF'}"
+        elif data == "india":
+            set_india(not india_on())
+            note = f"India group -> {'ON' if india_on() else 'OFF'}"
+        elif data.startswith("islot:"):
+            i = int(data.split(":")[1])
+            set_india_slot(i, not india_slot_on(i))
+            note = f"India slot {i+1} -> {'ON' if india_slot_on(i) else 'OFF'}"
         elif data == "all_on":
             for k in ORDER:
                 for i in range(4): set_slot(k, i, True)
