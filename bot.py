@@ -55,6 +55,13 @@ TV_SECRET   = os.environ.get("TV_SECRET", "tv-change-me")
 TG_SECRET   = os.environ.get("TG_SECRET", "tg-change-me")
 WINDOW_MIN  = int(os.environ.get("WINDOW_MIN", "30"))
 
+# Second destination: an extra group that receives ONLY a chosen slot (default
+# slot 3 = crypto 17:30 / metals 18:30). Set INDIA_CHAT in Railway to that
+# group's -100... id; leave it unset to disable. INDIA_SLOT_IDX is 0-based
+# (0=first trade of day, 2=third). Asset toggles + freshness still apply.
+INDIA_CHAT = os.environ.get("INDIA_CHAT", "").strip()
+INDIA_SLOT_IDX = int(os.environ.get("INDIA_SLOT_IDX", "2"))   # 2 = slot 3
+
 PUBLIC_URL = os.environ.get("PUBLIC_URL")
 if not PUBLIC_URL:
     dom = os.environ.get("RAILWAY_PUBLIC_DOMAIN")
@@ -230,6 +237,16 @@ def tv():
         return "forward failed", 200
 
     log.info("%s slot %s (%s) forwarded", key, idx, sched)
+
+    # Extra destination: send the chosen slot to the India community group too.
+    if INDIA_CHAT and idx == INDIA_SLOT_IDX:
+        r2 = tg("sendMessage", chat_id=INDIA_CHAT, text=out_text,
+                parse_mode="HTML", disable_web_page_preview=True)
+        if not r2.get("ok"):
+            dm_admin(f"Failed to forward {ASSETS[key]['label']} {sched} to India group:\n{r2}")
+        else:
+            log.info("%s slot %s (%s) also sent to India group", key, idx, sched)
+
     return "sent", 200
 
 @app.post(f"/telegram/{TG_SECRET}")
@@ -299,8 +316,10 @@ def on_boot():
     res = tg("setWebhook", url=hook, allowed_updates=["message", "callback_query"])
     log.info("setWebhook -> %s : %s", hook, res)
     total = sum(1 for k in ORDER for i in range(4) if slot_on(k, i))
+    india = f"ON (slot {INDIA_SLOT_IDX+1})" if INDIA_CHAT else "OFF"
     dm_admin(f"Relay v3 online.\nTrades ON: {total}/20\n"
              f"Freshness: {'ON' if window_on() else 'OFF'} ({WINDOW_MIN} min)\n"
+             f"India group: {india}\n"
              f"Send /alerts to manage.")
 
 on_boot()
