@@ -1,5 +1,5 @@
 """
-AxT CPR signal relay  v3  —  TradingView -> (filter) -> Telegram group
+AxT CPR signal relay  v4  —  TradingView -> (filter) -> Telegram group
 
 Control model: PER-ASSET x PER-TIME grid.
   Each asset (BTC, ETH, SOL, Gold, Silver) has its own 4 scheduled-time
@@ -146,6 +146,45 @@ def set_india(on):              rdb.set("cfg:india", "on" if on else "off")
 def india_slot_on(i):           return _get_bool(f"cfg:india:slot:{i}", i == INDIA_SLOT_IDX)  # default: only slot 3 ON
 def set_india_slot(i, on):      rdb.set(f"cfg:india:slot:{i}", "on" if on else "off")
 
+# entry-message store: remember the message_id of each forwarded entry so a
+# later TP1-hit can REPLY to it. Keyed by asset+group, carries the entry eid,
+# auto-expires after 6h so a very old entry never gets a stray reply.
+def store_entry_msg(key, grp, eid, res):
+    try:
+        mid = res["result"]["message_id"]
+        rdb.set(f"entrymsg:{key}:{grp}", json.dumps({"eid": str(eid), "mid": mid}), ex=21600)
+    except Exception as e:
+        log.error("store entrymsg %s:%s failed: %s", key, grp, e)
+
+def reply_tp1(key, eid, text):
+    """Reply to this asset's stored entry message in each group it went to.
+    Only replies when the stored entry's eid matches (never the wrong trade)."""
+    replied = []
+    for grp, chat in (("main", TARGET_CHAT), ("india", INDIA_CHAT)):
+        if not chat:
+            continue
+        try:
+            raw_stored = rdb.get(f"entrymsg:{key}:{grp}")
+        except Exception as e:
+            log.error("read entrymsg %s:%s failed: %s", key, grp, e)
+            raw_stored = None
+        if not raw_stored:
+            continue
+        try:
+            stored = json.loads(raw_stored)
+        except Exception:
+            continue
+        if eid and str(stored.get("eid")) != str(eid):
+            continue                       # different entry -> do not reply
+        r = tg("sendMessage", chat_id=chat, text=text, parse_mode="HTML",
+               reply_to_message_id=stored["mid"], disable_web_page_preview=True)
+        if not r.get("ok"):                # original gone? send without reply so it still lands
+            r = tg("sendMessage", chat_id=chat, text=text, parse_mode="HTML",
+                   disable_web_page_preview=True)
+        if r.get("ok"):
+            replied.append(grp)
+    return replied
+
 
 # --- telegram helpers -----------------------------------------------------
 def tg(method, **params):
@@ -228,11 +267,23 @@ def tv():
         log.warning("bad TV payload: %s", raw[:200])
         return "bad json", 400
 
-    text = data.get("text", "")
-    key = asset_key_from_symbol(text)
+    event  = (data.get("event") or "entry").lower()
+    eid    = data.get("eid", "")
+    symbol = data.get("symbol", "")
+    text   = data.get("text", "")
+    key = asset_key_from_symbol(symbol or text)
     if key is None:
         dm_admin(f"Could not identify asset in signal - dropped:\n{text[:200]}")
         return "unknown asset", 200
+
+    # TP1-hit follow-up: reply to this asset's forwarded entry message(s).
+    if event == "tp1":
+        replied = reply_tp1(key, eid, text)
+        if replied:
+            log.info("%s TP1 replied in %s", key, replied)
+            return "tp1 sent", 200
+        log.info("%s TP1 - no matching entry message, skipped", key)
+        return "tp1 no-match", 200
 
     group = ASSETS[key]["group"]
     idx, late, sched = slot_and_lateness(group, datetime.now(IST))
@@ -257,6 +308,7 @@ def tv():
         return "forward failed", 200
 
     log.info("%s slot %s (%s) forwarded", key, idx, sched)
+    store_entry_msg(key, "main", eid, res)
 
     # Extra destination: send the chosen slot to the India community group too.
     if INDIA_CHAT and india_on() and india_slot_on(idx):
@@ -266,6 +318,7 @@ def tv():
             dm_admin(f"Failed to forward {ASSETS[key]['label']} {sched} to India group:\n{r2}")
         else:
             log.info("%s slot %s (%s) also sent to India group", key, idx, sched)
+            store_entry_msg(key, "india", eid, r2)
 
     return "sent", 200
 
@@ -344,7 +397,7 @@ def on_boot():
     log.info("setWebhook -> %s : %s", hook, res)
     total = sum(1 for k in ORDER for i in range(4) if slot_on(k, i))
     india = f"ON (slot {INDIA_SLOT_IDX+1})" if INDIA_CHAT else "OFF"
-    dm_admin(f"Relay v3 online.\nTrades ON: {total}/20\n"
+    dm_admin(f"Relay v4 online (TP1 replies).\nTrades ON: {total}/20\n"
              f"Freshness: {'ON' if window_on() else 'OFF'} ({WINDOW_MIN} min)\n"
              f"India group: {india}\n"
              f"Send /alerts to manage.")
