@@ -1,5 +1,5 @@
 """
-AxT CPR signal relay  v4  —  TradingView -> (filter) -> Telegram group
+AxT CPR signal relay  v5  —  TradingView -> (filter) -> Telegram group
 
 Control model: PER-ASSET x PER-TIME grid.
   Each asset (BTC, ETH, SOL, Gold, Silver) has its own 4 scheduled-time
@@ -25,7 +25,9 @@ Env vars: BOT_TOKEN, ADMIN_ID, TARGET_CHAT, REDIS_URL, TV_SECRET, TG_SECRET,
 
 import os
 import json
+import time
 import logging
+import threading
 import datetime as _dt
 from datetime import datetime, timedelta, timezone
 
@@ -54,6 +56,12 @@ REDIS_URL   = _req("REDIS_URL")
 TV_SECRET   = os.environ.get("TV_SECRET", "tv-change-me")
 TG_SECRET   = os.environ.get("TG_SECRET", "tg-change-me")
 WINDOW_MIN  = int(os.environ.get("WINDOW_MIN", "30"))
+REPORT_TIME = os.environ.get("REPORT_TIME", "23:30")      # IST HH:MM for daily wrap
+try:
+    _rh, _rm = (int(x) for x in REPORT_TIME.split(":"))
+    REPORT_MIN = _rh * 60 + _rm
+except Exception:
+    REPORT_MIN = 23 * 60 + 30
 
 # Second destination: an extra group that receives ONLY a chosen slot (default
 # slot 3 = crypto 17:30 / metals 18:30). Set INDIA_CHAT in Railway to that
@@ -186,6 +194,123 @@ def reply_tp1(key, eid, text):
     return replied
 
 
+# ── daily-report trade tracking ────────────────────────────────────────────
+# A trade = an entry forwarded to the MAIN crypto channel. Status: open -> win
+# (TP1 hit) or loss (SL hit). Tallied and posted at REPORT_TIME IST.
+def ist_today():
+    return datetime.now(IST).strftime("%Y-%m-%d")
+
+def record_trade(key, eid, direction, date):
+    try:
+        field = f"{key}:{eid}"
+        rec = json.dumps({"asset": key, "dir": direction, "status": "open"})
+        rdb.hset(f"trades:{date}", field, rec)
+        rdb.expire(f"trades:{date}", 3 * 24 * 3600)
+        rdb.set(f"tdate:{key}:{eid}", date, ex=30 * 3600)
+    except Exception as e:
+        log.error("record_trade %s failed: %s", key, e)
+
+def mark_trade(key, eid, status):
+    try:
+        date = rdb.get(f"tdate:{key}:{eid}")
+        if not date:
+            return False
+        field = f"{key}:{eid}"
+        raw = rdb.hget(f"trades:{date}", field)
+        if not raw:
+            return False
+        rec = json.loads(raw)
+        if rec.get("status") == "open":          # never overwrite a terminal result
+            rec["status"] = status
+            rdb.hset(f"trades:{date}", field, json.dumps(rec))
+        return True
+    except Exception as e:
+        log.error("mark_trade %s failed: %s", key, e)
+        return False
+
+def build_report(date):
+    try:
+        data = rdb.hgetall(f"trades:{date}") or {}
+    except Exception as e:
+        log.error("report read failed: %s", e)
+        data = {}
+    try:
+        human = datetime.strptime(date, "%Y-%m-%d").strftime("%d %b %Y")
+    except Exception:
+        human = date
+
+    per = {}
+    tot = win = loss = opn = 0
+    for _f, raw in data.items():
+        try:
+            rec = json.loads(raw)
+        except Exception:
+            continue
+        a = rec.get("asset", "?"); s = rec.get("status", "open")
+        d = per.setdefault(a, {"given": 0, "win": 0, "loss": 0, "open": 0})
+        d["given"] += 1; tot += 1
+        if s == "win":   d["win"]  += 1; win  += 1
+        elif s == "loss":d["loss"] += 1; loss += 1
+        else:            d["open"] += 1; opn  += 1
+
+    if tot == 0:
+        return f"📊 <b>Daily Wrap — {human}</b>\n\nNo trades were given today."
+
+    resolved = win + loss
+    rate = f"{round(100 * win / resolved)}% ({win} of {resolved} resolved)" if resolved else "—"
+    lines = [f"📊 <b>Daily Wrap — {human}</b>", "",
+             f"Trades given: <b>{tot}</b>",
+             f"✅ TP1 hit: <b>{win}</b>",
+             f"❌ SL hit: <b>{loss}</b>",
+             f"⏳ Still open: <b>{opn}</b>",
+             f"🎯 Win rate: <b>{rate}</b>", "", "<b>Per asset</b>"]
+    for a in ("BTC", "ETH", "SOL", "XAU", "XAG"):
+        if a in per:
+            d = per[a]; lbl = ASSETS[a]["label"]
+            lines.append(f"• {lbl} — {d['given']} given · {d['win']} ✅ · {d['loss']} ❌ · {d['open']} ⏳")
+    return "\n".join(lines)
+
+def send_report(to_admin_only=False):
+    date = ist_today()
+    text = build_report(date)
+    chat = ADMIN_ID if to_admin_only else TARGET_CHAT
+    r = tg("sendMessage", chat_id=chat, text=text, parse_mode="HTML",
+           disable_web_page_preview=True)
+    if r.get("ok") and not to_admin_only:
+        try:
+            rdb.set("report:lastdate", date)
+        except Exception as e:
+            log.error("report lastdate set failed: %s", e)
+    return r
+
+# ── 11:30 PM IST scheduler (self-contained; Redis-deduped against restarts) ──
+_sched_started = False
+def _scheduler_loop():
+    while True:
+        try:
+            now = datetime.now(IST)
+            mod = now.hour * 60 + now.minute
+            today = now.strftime("%Y-%m-%d")
+            if mod >= REPORT_MIN:
+                try:
+                    last = rdb.get("report:lastdate")
+                except Exception:
+                    last = None
+                if last != today:
+                    send_report()
+                    log.info("daily report posted for %s", today)
+        except Exception as e:
+            log.error("scheduler error: %s", e)
+        time.sleep(45)
+
+def start_scheduler():
+    global _sched_started
+    if _sched_started:
+        return
+    _sched_started = True
+    threading.Thread(target=_scheduler_loop, daemon=True).start()
+
+
 # --- telegram helpers -----------------------------------------------------
 def tg(method, **params):
     try:
@@ -276,14 +401,18 @@ def tv():
         dm_admin(f"Could not identify asset in signal - dropped:\n{text[:200]}")
         return "unknown asset", 200
 
-    # TP1-hit follow-up: reply to this asset's forwarded entry message(s).
+    # TP1-hit follow-up: reply to the entry message AND mark the trade a win.
     if event == "tp1":
+        mark_trade(key, eid, "win")
         replied = reply_tp1(key, eid, text)
-        if replied:
-            log.info("%s TP1 replied in %s", key, replied)
-            return "tp1 sent", 200
-        log.info("%s TP1 - no matching entry message, skipped", key)
-        return "tp1 no-match", 200
+        log.info("%s TP1 win recorded; replied in %s", key, replied or "none")
+        return "tp1 ok", 200
+
+    # SL-hit: record a loss for the daily report. NOT posted to any group.
+    if event == "sl":
+        ok = mark_trade(key, eid, "loss")
+        log.info("%s SL recorded (%s) - not forwarded", key, "ok" if ok else "no-trade")
+        return "sl recorded", 200
 
     group = ASSETS[key]["group"]
     idx, late, sched = slot_and_lateness(group, datetime.now(IST))
@@ -309,6 +438,7 @@ def tv():
 
     log.info("%s slot %s (%s) forwarded", key, idx, sched)
     store_entry_msg(key, "main", eid, res)
+    record_trade(key, eid, ("BUY" if "BUY" in text else "SELL"), ist_today())
 
     # Extra destination: send the chosen slot to the India community group too.
     if INDIA_CHAT and india_on() and india_slot_on(idx):
@@ -335,6 +465,11 @@ def telegram():
         if txt.startswith("/alerts") or txt.startswith("/start"):
             tg("sendMessage", chat_id=ADMIN_ID, text=panel_text(),
                parse_mode="HTML", reply_markup=build_keyboard(now))
+        elif txt.startswith("/reporttest"):
+            send_report(to_admin_only=True)        # preview to you, not the channel
+        elif txt.startswith("/report"):
+            send_report()                          # post to the crypto channel now
+            tg("sendMessage", chat_id=ADMIN_ID, text="Daily wrap posted to the channel.")
         return "ok", 200
 
     cq = upd.get("callback_query")
@@ -395,11 +530,14 @@ def on_boot():
     hook = f"{PUBLIC_URL}/telegram/{TG_SECRET}"
     res = tg("setWebhook", url=hook, allowed_updates=["message", "callback_query"])
     log.info("setWebhook -> %s : %s", hook, res)
+    start_scheduler()
     total = sum(1 for k in ORDER for i in range(4) if slot_on(k, i))
     india = f"ON (slot {INDIA_SLOT_IDX+1})" if INDIA_CHAT else "OFF"
-    dm_admin(f"Relay v4 online (TP1 replies).\nTrades ON: {total}/20\n"
+    dm_admin(f"Relay v5 online (TP1 + SL + daily wrap @ {REPORT_TIME} IST).\n"
+             f"Trades ON: {total}/20\n"
              f"Freshness: {'ON' if window_on() else 'OFF'} ({WINDOW_MIN} min)\n"
              f"India group: {india}\n"
+             f"Report: /report posts now · /reporttest previews to you\n"
              f"Send /alerts to manage.")
 
 on_boot()
