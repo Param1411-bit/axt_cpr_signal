@@ -77,6 +77,7 @@ if not PUBLIC_URL:
 PUBLIC_URL = PUBLIC_URL.rstrip("/")
 
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+SHARK_SIGNUP = "https://sharkexchange.in/auth/signup?code=XAP917"
 
 
 # --- assets & DST-aware schedules -----------------------------------------
@@ -271,33 +272,44 @@ def build_report(date, ledger, assets, lang):
         else:            d["open"] += 1; opn  += 1
 
     resolved = win + loss
-    rate = f"{round(100 * win / resolved)}%" if resolved else "—"
     order = [a for a in ("BTC", "ETH", "SOL", "XAU", "XAG") if a in assets]
+    cta = f'🔗 <a href="{SHARK_SIGNUP}">Trade on Shark Exchange</a>'
 
     if lang == "hi":
         if tot == 0:
             return None                     # skip an empty nifty wrap
-        lines = [f"📊 <b>Aaj ka Crypto Wrap — {human}</b>", "(sirf 5:30 PM wale trades)", ""]
+        rate = f"{round(100 * win / resolved)}%  ({resolved} me se {win} profit)" if resolved else "— (abhi koi trade close nahi hua)"
+        lines = [f"📊 <b>Aaj ka Crypto Wrap — {human}</b>",
+                 "<i>sirf 5:30 PM wale trades</i>", ""]
         for a in order:
             if a in per:
                 d = per[a]
-                extra = f" · ⏳ {d['open']}" if d["open"] else ""
-                lines.append(f"• {a} — {d['given']} trade · ✅ {d['win']} · ❌ {d['loss']}{extra}")
-        tail = f"Total: {tot} · ✅ {win} · ❌ {loss}" + (f" · ⏳ {opn}" if opn else "")
-        lines += ["", tail, f"🎯 Win rate: {rate}"]
+                parts = [f"✅ {d['win']} profit", f"❌ {d['loss']} loss"]
+                if d["open"]:
+                    parts.append(f"⏳ {d['open']} open")
+                lines.append(f"<b>{a}</b> — {d['given']} trade:  " + " · ".join(parts))
+        lines += ["",
+                  f"<b>Total trades:</b> {tot}",
+                  f"✅ Profit: {win}   ❌ Loss: {loss}   ⏳ Open: {opn}",
+                  f"🎯 <b>Win rate:</b> {rate}", "", cta]
         return "\n".join(lines)
 
-    # English (crypto channel) — simple, asset-wise
+    # English (crypto channel) — clear, asset-wise
     if tot == 0:
-        return f"📊 <b>Daily Wrap — {human}</b>\n\nNo trades today."
+        return f"📊 <b>Daily Wrap — {human}</b>\n\nNo trades today.\n\n{cta}"
+    rate = f"{round(100 * win / resolved)}%  ({win} of {resolved} closed)" if resolved else "— (no trades closed yet)"
     lines = [f"📊 <b>Daily Wrap — {human}</b>", ""]
     for a in order:
         if a in per:
             d = per[a]; lbl = ASSETS[a]["label"]
-            extra = f" · ⏳ {d['open']}" if d["open"] else ""
-            lines.append(f"• {lbl} — {d['given']} · ✅ {d['win']} · ❌ {d['loss']}{extra}")
-    tail = f"Total: {tot} · ✅ {win} · ❌ {loss}" + (f" · ⏳ {opn}" if opn else "")
-    lines += ["", tail, f"🎯 Win rate: {rate}"]
+            parts = [f"✅ {d['win']} win", f"❌ {d['loss']} loss"]
+            if d["open"]:
+                parts.append(f"⏳ {d['open']} open")
+            lines.append(f"<b>{lbl}</b> — {d['given']} trades:  " + " · ".join(parts))
+    lines += ["",
+              f"<b>Total trades:</b> {tot}",
+              f"✅ Win: {win}   ❌ Loss: {loss}   ⏳ Open: {opn}",
+              f"🎯 <b>Win rate:</b> {rate}", "", cta]
     return "\n".join(lines)
 
 def send_report(to_admin_only=False):
