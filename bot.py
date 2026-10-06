@@ -210,29 +210,43 @@ def record_trade(key, eid, direction, date):
     except Exception as e:
         log.error("record_trade %s failed: %s", key, e)
 
+def record_nifty(key, eid, direction, date):
+    # separate ledger for the nifty (India) channel — 5:30 crypto trades only
+    try:
+        field = f"{key}:{eid}"
+        rec = json.dumps({"asset": key, "dir": direction, "status": "open"})
+        rdb.hset(f"niftytrades:{date}", field, rec)
+        rdb.expire(f"niftytrades:{date}", 3 * 24 * 3600)
+        rdb.set(f"tdate:{key}:{eid}", date, ex=30 * 3600)
+    except Exception as e:
+        log.error("record_nifty %s failed: %s", key, e)
+
 def mark_trade(key, eid, status):
     try:
         date = rdb.get(f"tdate:{key}:{eid}")
         if not date:
             return False
         field = f"{key}:{eid}"
-        raw = rdb.hget(f"trades:{date}", field)
-        if not raw:
-            return False
-        rec = json.loads(raw)
-        if rec.get("status") == "open":          # never overwrite a terminal result
-            rec["status"] = status
-            rdb.hset(f"trades:{date}", field, json.dumps(rec))
-        return True
+        updated = False
+        for ledger in ("trades", "niftytrades"):   # update both if present
+            raw = rdb.hget(f"{ledger}:{date}", field)
+            if not raw:
+                continue
+            rec = json.loads(raw)
+            if rec.get("status") == "open":         # never overwrite a terminal result
+                rec["status"] = status
+                rdb.hset(f"{ledger}:{date}", field, json.dumps(rec))
+            updated = True
+        return updated
     except Exception as e:
         log.error("mark_trade %s failed: %s", key, e)
         return False
 
-def build_report(date):
+def build_report(date, ledger, assets, lang):
     try:
-        data = rdb.hgetall(f"trades:{date}") or {}
+        data = rdb.hgetall(f"{ledger}:{date}") or {}
     except Exception as e:
-        log.error("report read failed: %s", e)
+        log.error("report read %s failed: %s", ledger, e)
         data = {}
     try:
         human = datetime.strptime(date, "%Y-%m-%d").strftime("%d %b %Y")
@@ -246,36 +260,63 @@ def build_report(date):
             rec = json.loads(raw)
         except Exception:
             continue
-        a = rec.get("asset", "?"); s = rec.get("status", "open")
+        a = rec.get("asset", "?")
+        if a not in assets:                 # crypto-only wrap skips gold/silver
+            continue
+        s = rec.get("status", "open")
         d = per.setdefault(a, {"given": 0, "win": 0, "loss": 0, "open": 0})
         d["given"] += 1; tot += 1
         if s == "win":   d["win"]  += 1; win  += 1
         elif s == "loss":d["loss"] += 1; loss += 1
         else:            d["open"] += 1; opn  += 1
 
-    if tot == 0:
-        return f"📊 <b>Daily Wrap — {human}</b>\n\nNo trades were given today."
-
     resolved = win + loss
-    rate = f"{round(100 * win / resolved)}% ({win} of {resolved} resolved)" if resolved else "—"
-    lines = [f"📊 <b>Daily Wrap — {human}</b>", "",
-             f"Trades given: <b>{tot}</b>",
-             f"✅ TP1 hit: <b>{win}</b>",
-             f"❌ SL hit: <b>{loss}</b>",
-             f"⏳ Still open: <b>{opn}</b>",
-             f"🎯 Win rate: <b>{rate}</b>", "", "<b>Per asset</b>"]
-    for a in ("BTC", "ETH", "SOL", "XAU", "XAG"):
+    rate = f"{round(100 * win / resolved)}%" if resolved else "—"
+    order = [a for a in ("BTC", "ETH", "SOL", "XAU", "XAG") if a in assets]
+
+    if lang == "hi":
+        if tot == 0:
+            return None                     # skip an empty nifty wrap
+        lines = [f"📊 <b>Aaj ka Crypto Wrap — {human}</b>", "(sirf 5:30 PM wale trades)", ""]
+        for a in order:
+            if a in per:
+                d = per[a]
+                extra = f" · ⏳ {d['open']}" if d["open"] else ""
+                lines.append(f"• {a} — {d['given']} trade · ✅ {d['win']} · ❌ {d['loss']}{extra}")
+        tail = f"Total: {tot} · ✅ {win} · ❌ {loss}" + (f" · ⏳ {opn}" if opn else "")
+        lines += ["", tail, f"🎯 Win rate: {rate}"]
+        return "\n".join(lines)
+
+    # English (crypto channel) — simple, asset-wise
+    if tot == 0:
+        return f"📊 <b>Daily Wrap — {human}</b>\n\nNo trades today."
+    lines = [f"📊 <b>Daily Wrap — {human}</b>", ""]
+    for a in order:
         if a in per:
             d = per[a]; lbl = ASSETS[a]["label"]
-            lines.append(f"• {lbl} — {d['given']} given · {d['win']} ✅ · {d['loss']} ❌ · {d['open']} ⏳")
+            extra = f" · ⏳ {d['open']}" if d["open"] else ""
+            lines.append(f"• {lbl} — {d['given']} · ✅ {d['win']} · ❌ {d['loss']}{extra}")
+    tail = f"Total: {tot} · ✅ {win} · ❌ {loss}" + (f" · ⏳ {opn}" if opn else "")
+    lines += ["", tail, f"🎯 Win rate: {rate}"]
     return "\n".join(lines)
 
 def send_report(to_admin_only=False):
     date = ist_today()
-    text = build_report(date)
+    CRYPTO = ("BTC", "ETH", "SOL")
+
+    # 1) Crypto channel — simple, asset-wise, English (crypto only)
+    crypto_txt = build_report(date, "trades", CRYPTO, "en")
     chat = ADMIN_ID if to_admin_only else TARGET_CHAT
-    r = tg("sendMessage", chat_id=chat, text=text, parse_mode="HTML",
+    r = tg("sendMessage", chat_id=chat, text=crypto_txt, parse_mode="HTML",
            disable_web_page_preview=True)
+
+    # 2) Nifty (India) channel — Hinglish, 5:30 crypto only; skip if empty
+    nifty_txt = build_report(date, "niftytrades", CRYPTO, "hi")
+    if nifty_txt and INDIA_CHAT and india_on():
+        nchat = ADMIN_ID if to_admin_only else INDIA_CHAT
+        tg("sendMessage", chat_id=nchat, text=nifty_txt, parse_mode="HTML",
+           disable_web_page_preview=True)
+
     if r.get("ok") and not to_admin_only:
         try:
             rdb.set("report:lastdate", date)
@@ -449,6 +490,8 @@ def tv():
         else:
             log.info("%s slot %s (%s) also sent to India group", key, idx, sched)
             store_entry_msg(key, "india", eid, r2)
+            if ASSETS[key]["group"] == "crypto":      # nifty wrap = 5:30 crypto only
+                record_nifty(key, eid, ("BUY" if "BUY" in text else "SELL"), ist_today())
 
     return "sent", 200
 
