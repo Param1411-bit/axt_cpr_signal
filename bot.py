@@ -1,5 +1,5 @@
 """
-AxT CPR signal relay  v5  —  TradingView -> (filter) -> Telegram group
+AxT CPR signal relay  v7  —  TradingView -> (filter) -> Telegram group
 
 Control model: PER-ASSET x PER-TIME grid.
   Each asset (BTC, ETH, SOL, Gold, Silver) has its own 4 scheduled-time
@@ -28,6 +28,7 @@ import json
 import time
 import logging
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import datetime as _dt
 from datetime import datetime, timedelta, timezone
 
@@ -427,6 +428,9 @@ def panel_text():
 
 # --- app & routes ---------------------------------------------------------
 app = Flask(__name__)
+# Forward in the background so the webhook replies to TradingView within its
+# ~3s timeout. Telegram sends (main + India) happen off the request thread.
+EXECUTOR = ThreadPoolExecutor(max_workers=8)
 
 @app.get("/health")
 def health():
@@ -436,14 +440,14 @@ def health():
 def root():
     return "relay up", 200
 
-@app.post(f"/tv/{TV_SECRET}")
-def tv():
-    raw = request.get_data(as_text=True)
+def process_tv(raw):
+    """Runs in a background thread — all Telegram/Redis work happens here so the
+    HTTP handler can answer TradingView instantly (avoids its ~3s timeout)."""
     try:
         data = json.loads(raw)
     except Exception:
         log.warning("bad TV payload: %s", raw[:200])
-        return "bad json", 400
+        return
 
     event  = (data.get("event") or "entry").lower()
     eid    = data.get("eid", "")
@@ -452,31 +456,31 @@ def tv():
     key = asset_key_from_symbol(symbol or text)
     if key is None:
         dm_admin(f"Could not identify asset in signal - dropped:\n{text[:200]}")
-        return "unknown asset", 200
+        return
 
     # TP1-hit follow-up: reply to the entry message AND mark the trade a win.
     if event == "tp1":
         mark_trade(key, eid, "win")
         replied = reply_tp1(key, eid, text)
         log.info("%s TP1 win recorded; replied in %s", key, replied or "none")
-        return "tp1 ok", 200
+        return
 
     # SL-hit: record a loss for the daily report. NOT posted to any group.
     if event == "sl":
         ok = mark_trade(key, eid, "loss")
         log.info("%s SL recorded (%s) - not forwarded", key, "ok" if ok else "no-trade")
-        return "sl recorded", 200
+        return
 
     group = ASSETS[key]["group"]
     idx, late, sched = slot_and_lateness(group, datetime.now(IST))
 
     if window_on() and late > WINDOW_MIN:
         log.info("%s stale: %d min past %s - dropped", key, late, sched)
-        return "stale", 200
+        return
 
     if not slot_on(key, idx):
         log.info("%s slot %s (%s) OFF - dropped", key, idx, sched)
-        return "slot off", 200
+        return
 
     # append probability label (keyed to the slot index, DST-safe)
     out_text = text
@@ -487,7 +491,7 @@ def tv():
              parse_mode="HTML", disable_web_page_preview=True)
     if not res.get("ok"):
         dm_admin(f"Failed to forward {ASSETS[key]['label']} {sched} signal:\n{res}")
-        return "forward failed", 200
+        return
 
     log.info("%s slot %s (%s) forwarded", key, idx, sched)
     store_entry_msg(key, "main", eid, res)
@@ -505,7 +509,12 @@ def tv():
             if ASSETS[key]["group"] == "crypto":      # nifty wrap = 5:30 crypto only
                 record_nifty(key, eid, ("BUY" if "BUY" in text else "SELL"), ist_today())
 
-    return "sent", 200
+
+@app.post(f"/tv/{TV_SECRET}")
+def tv():
+    raw = request.get_data(as_text=True)
+    EXECUTOR.submit(process_tv, raw)      # reply now, forward in background
+    return "ok", 200
 
 @app.post(f"/telegram/{TG_SECRET}")
 def telegram():
