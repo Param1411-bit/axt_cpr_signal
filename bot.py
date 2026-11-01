@@ -64,6 +64,10 @@ try:
 except Exception:
     REPORT_MIN = 23 * 60 + 30
 
+# A trade that hits neither TP1 nor SL within this many hours is "expired"
+# (a scratch - excluded from the win rate), never left open forever.
+EXPIRE_SEC = int(os.environ.get("EXPIRE_HOURS", "4")) * 3600
+
 # Second destination: an extra group that receives ONLY a chosen slot (default
 # slot 3 = crypto 17:30 / metals 18:30). Set INDIA_CHAT in Railway to that
 # group's -100... id; leave it unset to disable. INDIA_SLOT_IDX is 0-based
@@ -205,7 +209,8 @@ def ist_today():
 def record_trade(key, eid, direction, date):
     try:
         field = f"{key}:{eid}"
-        rec = json.dumps({"asset": key, "dir": direction, "status": "open"})
+        rec = json.dumps({"asset": key, "dir": direction, "status": "open",
+                          "ts": int(time.time())})
         rdb.hset(f"trades:{date}", field, rec)
         rdb.expire(f"trades:{date}", 3 * 24 * 3600)
         rdb.set(f"tdate:{key}:{eid}", date, ex=30 * 3600)
@@ -216,12 +221,23 @@ def record_nifty(key, eid, direction, date):
     # separate ledger for the nifty (India) channel — 5:30 crypto trades only
     try:
         field = f"{key}:{eid}"
-        rec = json.dumps({"asset": key, "dir": direction, "status": "open"})
+        rec = json.dumps({"asset": key, "dir": direction, "status": "open",
+                          "ts": int(time.time())})
         rdb.hset(f"niftytrades:{date}", field, rec)
         rdb.expire(f"niftytrades:{date}", 3 * 24 * 3600)
         rdb.set(f"tdate:{key}:{eid}", date, ex=30 * 3600)
     except Exception as e:
         log.error("record_nifty %s failed: %s", key, e)
+
+def _effective_status(rec):
+    """open -> expired once older than EXPIRE_SEC. win/loss/expired stay as-is."""
+    s = rec.get("status", "open")
+    if s != "open":
+        return s
+    ts = rec.get("ts")
+    if ts is None:
+        return "expired"          # legacy record (pre-fix, no timestamp) = closed
+    return "expired" if (time.time() - ts) > EXPIRE_SEC else "open"
 
 def mark_trade(key, eid, status):
     try:
@@ -236,7 +252,9 @@ def mark_trade(key, eid, status):
                 continue
             rec = json.loads(raw)
             if rec.get("status") == "open":         # never overwrite a terminal result
-                rec["status"] = status
+                # a TP1/SL that arrives after the 4h window closes it as expired,
+                # not as a win/loss - keeps the wrap honest to the 4h rule.
+                rec["status"] = "expired" if _effective_status(rec) == "expired" else status
                 rdb.hset(f"{ledger}:{date}", field, json.dumps(rec))
             updated = True
         return updated
@@ -256,7 +274,7 @@ def build_report(date, ledger, assets, lang):
         human = date
 
     per = {}
-    tot = win = loss = opn = 0
+    tot = win = loss = opn = exp = 0
     for _f, raw in data.items():
         try:
             rec = json.loads(raw)
@@ -265,12 +283,13 @@ def build_report(date, ledger, assets, lang):
         a = rec.get("asset", "?")
         if a not in assets:                 # crypto-only wrap skips gold/silver
             continue
-        s = rec.get("status", "open")
-        d = per.setdefault(a, {"given": 0, "win": 0, "loss": 0, "open": 0})
+        s = _effective_status(rec)          # open auto-expires after 4h
+        d = per.setdefault(a, {"given": 0, "win": 0, "loss": 0, "open": 0, "expired": 0})
         d["given"] += 1; tot += 1
-        if s == "win":   d["win"]  += 1; win  += 1
-        elif s == "loss":d["loss"] += 1; loss += 1
-        else:            d["open"] += 1; opn  += 1
+        if s == "win":       d["win"]     += 1; win  += 1
+        elif s == "loss":    d["loss"]    += 1; loss += 1
+        elif s == "expired": d["expired"] += 1; exp  += 1
+        else:                d["open"]    += 1; opn  += 1
 
     resolved = win + loss
     order = [a for a in ("BTC", "ETH", "SOL", "XAU", "XAG") if a in assets]
@@ -286,12 +305,17 @@ def build_report(date, ledger, assets, lang):
             if a in per:
                 d = per[a]
                 parts = [f"✅ {d['win']} profit", f"❌ {d['loss']} loss"]
+                if d["expired"]:
+                    parts.append(f"➖ {d['expired']} expire")
                 if d["open"]:
                     parts.append(f"⏳ {d['open']} open")
                 lines.append(f"<b>{a}</b> — {d['given']} trade:  " + " · ".join(parts))
+        tline = f"✅ Profit: {win}   ❌ Loss: {loss}"
+        if exp: tline += f"   ➖ Expire: {exp}"
+        if opn: tline += f"   ⏳ Open: {opn}"
         lines += ["",
                   f"<b>Total trades:</b> {tot}",
-                  f"✅ Profit: {win}   ❌ Loss: {loss}   ⏳ Open: {opn}",
+                  tline,
                   f"🎯 <b>Win rate:</b> {rate}", "", cta]
         return "\n".join(lines)
 
@@ -304,12 +328,17 @@ def build_report(date, ledger, assets, lang):
         if a in per:
             d = per[a]; lbl = ASSETS[a]["label"]
             parts = [f"✅ {d['win']} win", f"❌ {d['loss']} loss"]
+            if d["expired"]:
+                parts.append(f"➖ {d['expired']} expired")
             if d["open"]:
                 parts.append(f"⏳ {d['open']} open")
             lines.append(f"<b>{lbl}</b> — {d['given']} trades:  " + " · ".join(parts))
+    tline = f"✅ Win: {win}   ❌ Loss: {loss}"
+    if exp: tline += f"   ➖ Expired: {exp}"
+    if opn: tline += f"   ⏳ Open: {opn}"
     lines += ["",
               f"<b>Total trades:</b> {tot}",
-              f"✅ Win: {win}   ❌ Loss: {loss}   ⏳ Open: {opn}",
+              tline,
               f"🎯 <b>Win rate:</b> {rate}", "", cta]
     return "\n".join(lines)
 
@@ -441,8 +470,16 @@ def root():
     return "relay up", 200
 
 def process_tv(raw):
-    """Runs in a background thread — all Telegram/Redis work happens here so the
-    HTTP handler can answer TradingView instantly (avoids its ~3s timeout)."""
+    """Runs in a background thread. One webhook body may carry several
+    newline-separated JSON events (the indicator batches same-bar TP1/SL hits
+    into a single alert), so split and handle each line on its own."""
+    for line in (raw or "").split("\n"):
+        line = line.strip()
+        if line:
+            _process_one(line)
+
+def _process_one(raw):
+    """Handle one JSON event (entry / tp1 / sl)."""
     try:
         data = json.loads(raw)
     except Exception:
@@ -597,7 +634,7 @@ def on_boot():
     start_scheduler()
     total = sum(1 for k in ORDER for i in range(4) if slot_on(k, i))
     india = f"ON (slot {INDIA_SLOT_IDX+1})" if INDIA_CHAT else "OFF"
-    dm_admin(f"Relay v5 online (TP1 + SL + daily wrap @ {REPORT_TIME} IST).\n"
+    dm_admin(f"Relay v8 online (TP1=win · SL=loss · {EXPIRE_SEC//3600}h expiry · wrap @ {REPORT_TIME} IST).\n"
              f"Trades ON: {total}/20\n"
              f"Freshness: {'ON' if window_on() else 'OFF'} ({WINDOW_MIN} min)\n"
              f"India group: {india}\n"
