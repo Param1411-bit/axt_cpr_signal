@@ -236,7 +236,9 @@ def _effective_status(rec):
         return s
     ts = rec.get("ts")
     if ts is None:
-        return "expired"          # legacy record (pre-fix, no timestamp) = closed
+        # No entry time (recorded before v8 was deployed) -> we can't age it,
+        # so never fabricate an expiry; leave it open.
+        return "open"
     return "expired" if (time.time() - ts) > EXPIRE_SEC else "open"
 
 def mark_trade(key, eid, status):
