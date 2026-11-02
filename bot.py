@@ -64,10 +64,6 @@ try:
 except Exception:
     REPORT_MIN = 23 * 60 + 30
 
-# A trade that hits neither TP1 nor SL within this many hours is "expired"
-# (a scratch - excluded from the win rate), never left open forever.
-EXPIRE_SEC = int(os.environ.get("EXPIRE_HOURS", "4")) * 3600
-
 # Second destination: an extra group that receives ONLY a chosen slot (default
 # slot 3 = crypto 17:30 / metals 18:30). Set INDIA_CHAT in Railway to that
 # group's -100... id; leave it unset to disable. INDIA_SLOT_IDX is 0-based
@@ -229,17 +225,69 @@ def record_nifty(key, eid, direction, date):
     except Exception as e:
         log.error("record_nifty %s failed: %s", key, e)
 
-def _effective_status(rec):
-    """open -> expired once older than EXPIRE_SEC. win/loss/expired stay as-is."""
-    s = rec.get("status", "open")
-    if s != "open":
-        return s
-    ts = rec.get("ts")
-    if ts is None:
-        # No entry time (recorded before v8 was deployed) -> we can't age it,
-        # so never fabricate an expiry; leave it open.
-        return "open"
-    return "expired" if (time.time() - ts) > EXPIRE_SEC else "open"
+# ── Carry-forward resolution ────────────────────────────────────────────────
+# Own TP1 -> win, own SL -> loss (set by mark_trade). A trade that hits neither
+# is resolved by the NEXT trade (same asset, in time order) that DOES resolve:
+# that trade's "verdict direction" is its own dir if it won, or the opposite if
+# it was stopped. The earlier trade is a carried-win if that direction matches
+# its own, else a carried-loss. If no later trade has resolved yet, it's pending.
+# Carried results are shown separately and are NOT in the headline win rate.
+def _opp(d):
+    return "SELL" if (d or "").upper() == "BUY" else "BUY"
+
+def _eid_of(field):
+    try:
+        return int(field.split(":", 1)[1])
+    except Exception:
+        return 0
+
+def _resolve_sequence(seq):
+    """seq: dicts {'dir','status'} in time order. Returns parallel categories:
+    win/loss (own TP1/SL), cwin/closs (carried), pending (no later resolver yet)."""
+    n = len(seq)
+    out = []
+    for i in range(n):
+        s = seq[i].get("status") or "open"
+        if s == "win":
+            out.append("win")
+        elif s == "loss":
+            out.append("loss")
+        else:
+            verdict = None
+            for j in range(i + 1, n):
+                sj = seq[j].get("status") or "open"
+                if sj in ("win", "loss"):
+                    dj = seq[j].get("dir", "")
+                    verdict = dj if sj == "win" else _opp(dj)
+                    break
+            if verdict is None:
+                out.append("pending")
+            else:
+                out.append("cwin" if verdict == seq[i].get("dir", "") else "closs")
+    return out
+
+def _resolve_crypto(date):
+    """Resolve the FULL crypto trade sequence. Returns {field: (asset, category)}."""
+    try:
+        data = rdb.hgetall(f"trades:{date}") or {}
+    except Exception as e:
+        log.error("resolve read failed: %s", e)
+        data = {}
+    byasset = {}
+    for f, raw in data.items():
+        try:
+            rec = json.loads(raw)
+        except Exception:
+            continue
+        rec["_field"] = f
+        rec["_ord"]   = rec.get("ts") or _eid_of(f)
+        byasset.setdefault(rec.get("asset", "?"), []).append(rec)
+    out = {}
+    for a, recs in byasset.items():
+        recs.sort(key=lambda r: r.get("_ord", 0))
+        for rec, cat in zip(recs, _resolve_sequence(recs)):
+            out[rec["_field"]] = (a, cat)
+    return out
 
 def mark_trade(key, eid, status):
     try:
@@ -253,10 +301,8 @@ def mark_trade(key, eid, status):
             if not raw:
                 continue
             rec = json.loads(raw)
-            if rec.get("status") == "open":         # never overwrite a terminal result
-                # a TP1/SL that arrives after the 4h window closes it as expired,
-                # not as a win/loss - keeps the wrap honest to the 4h rule.
-                rec["status"] = "expired" if _effective_status(rec) == "expired" else status
+            if rec.get("status") == "open":         # never overwrite a terminal own-result
+                rec["status"] = status              # "win" (own TP1) or "loss" (own SL)
                 rdb.hset(f"{ledger}:{date}", field, json.dumps(rec))
             updated = True
         return updated
@@ -264,104 +310,106 @@ def mark_trade(key, eid, status):
         log.error("mark_trade %s failed: %s", key, e)
         return False
 
-def build_report(date, ledger, assets, lang):
-    try:
-        data = rdb.hgetall(f"{ledger}:{date}") or {}
-    except Exception as e:
-        log.error("report read %s failed: %s", ledger, e)
-        data = {}
+def build_report(date, lang, assets, only_fields=None):
     try:
         human = datetime.strptime(date, "%Y-%m-%d").strftime("%d %b %Y")
     except Exception:
         human = date
+    resolved = _resolve_crypto(date)        # field -> (asset, category); carry uses the FULL sequence
 
     per = {}
-    tot = win = loss = opn = exp = 0
-    for _f, raw in data.items():
-        try:
-            rec = json.loads(raw)
-        except Exception:
-            continue
-        a = rec.get("asset", "?")
+    tot = w = l = cw = cl = pend = 0
+    for field, (a, c) in resolved.items():
         if a not in assets:                 # crypto-only wrap skips gold/silver
             continue
-        s = _effective_status(rec)          # open auto-expires after 4h
-        d = per.setdefault(a, {"given": 0, "win": 0, "loss": 0, "open": 0, "expired": 0})
-        d["given"] += 1; tot += 1
-        if s == "win":       d["win"]     += 1; win  += 1
-        elif s == "loss":    d["loss"]    += 1; loss += 1
-        elif s == "expired": d["expired"] += 1; exp  += 1
-        else:                d["open"]    += 1; opn  += 1
+        if only_fields is not None and field not in only_fields:
+            continue                        # India wrap: show only its own trades
+        d = per.setdefault(a, {"n": 0, "win": 0, "loss": 0, "cwin": 0, "closs": 0, "pending": 0})
+        d["n"] += 1; d[c] += 1; tot += 1
+        if   c == "win":   w += 1
+        elif c == "loss":  l += 1
+        elif c == "cwin":  cw += 1
+        elif c == "closs": cl += 1
+        else:              pend += 1
 
-    resolved = win + loss
-    order = [a for a in ("BTC", "ETH", "SOL", "XAU", "XAG") if a in assets]
+    rc = w + l                              # resolved on their OWN TP1/SL -> the win-rate base
+    order = [a for a in ("BTC", "ETH", "SOL", "XAU", "XAG") if a in per]
     cta = f'🔗 <a href="{SHARK_SIGNUP}">Trade on Shark Exchange</a>'
+
+    def chips(d, hi):
+        p = [f"✅ {d['win']} {'profit' if hi else 'win'}", f"❌ {d['loss']} loss"]
+        if d["cwin"]:    p.append(f"➕ {d['cwin']} carry-win")
+        if d["closs"]:   p.append(f"➖ {d['closs']} carry-loss")
+        if d["pending"]: p.append(f"⏳ {d['pending']} pending")
+        return p
+
+    def totline(hi):
+        t = f"✅ {'Profit' if hi else 'Win'}: {w}   ❌ Loss: {l}"
+        if cw:   t += f"   ➕ Carry-win: {cw}"
+        if cl:   t += f"   ➖ Carry-loss: {cl}"
+        if pend: t += f"   ⏳ Pending: {pend}"
+        return t
 
     if lang == "hi":
         if tot == 0:
             return None                     # skip an empty nifty wrap
-        rate = f"{round(100 * win / resolved)}%  ({resolved} me se {win} profit)" if resolved else "— (abhi koi trade close nahi hua)"
+        rate = f"{round(100 * w / rc)}%  ({rc} me se {w} profit)" if rc else "— (abhi koi trade TP/SL pe close nahi hua)"
         lines = [f"📊 <b>Aaj ka Crypto Wrap — {human}</b>",
                  "<i>sirf 5:30 PM wale trades</i>", ""]
         for a in order:
-            if a in per:
-                d = per[a]
-                parts = [f"✅ {d['win']} profit", f"❌ {d['loss']} loss"]
-                if d["expired"]:
-                    parts.append(f"➖ {d['expired']} expire")
-                if d["open"]:
-                    parts.append(f"⏳ {d['open']} open")
-                lines.append(f"<b>{a}</b> — {d['given']} trade:  " + " · ".join(parts))
-        tline = f"✅ Profit: {win}   ❌ Loss: {loss}"
-        if exp: tline += f"   ➖ Expire: {exp}"
-        if opn: tline += f"   ⏳ Open: {opn}"
+            lines.append(f"<b>{a}</b> — {per[a]['n']} trade:  " + " · ".join(chips(per[a], True)))
         lines += ["",
                   f"<b>Total trades:</b> {tot}",
-                  tline,
-                  f"🎯 <b>Win rate:</b> {rate}", "", cta]
+                  totline(True),
+                  f"🎯 <b>Win rate:</b> {rate}",
+                  "<i>win rate sirf apne TP1/SL pe close hue trades ka hai</i>", "", cta]
         return "\n".join(lines)
 
     # English (crypto channel) — clear, asset-wise
     if tot == 0:
         return f"📊 <b>Daily Wrap — {human}</b>\n\nNo trades today.\n\n{cta}"
-    rate = f"{round(100 * win / resolved)}%  ({win} of {resolved} closed)" if resolved else "— (no trades closed yet)"
+    rate = f"{round(100 * w / rc)}%  ({w} of {rc} closed)" if rc else "— (no trades closed yet)"
     lines = [f"📊 <b>Daily Wrap — {human}</b>", ""]
     for a in order:
-        if a in per:
-            d = per[a]; lbl = ASSETS[a]["label"]
-            parts = [f"✅ {d['win']} win", f"❌ {d['loss']} loss"]
-            if d["expired"]:
-                parts.append(f"➖ {d['expired']} expired")
-            if d["open"]:
-                parts.append(f"⏳ {d['open']} open")
-            lines.append(f"<b>{lbl}</b> — {d['given']} trades:  " + " · ".join(parts))
-    tline = f"✅ Win: {win}   ❌ Loss: {loss}"
-    if exp: tline += f"   ➖ Expired: {exp}"
-    if opn: tline += f"   ⏳ Open: {opn}"
+        lines.append(f"<b>{ASSETS[a]['label']}</b> — {per[a]['n']} trades:  " + " · ".join(chips(per[a], False)))
     lines += ["",
               f"<b>Total trades:</b> {tot}",
-              tline,
-              f"🎯 <b>Win rate:</b> {rate}", "", cta]
+              totline(False),
+              f"🎯 <b>Win rate:</b> {rate}",
+              "<i>win rate = trades that hit their own TP1/SL only</i>", "", cta]
     return "\n".join(lines)
 
 def send_report(to_admin_only=False):
     date = ist_today()
     CRYPTO = ("BTC", "ETH", "SOL")
 
-    # 1) Crypto channel — simple, asset-wise, English (crypto only)
-    crypto_txt = build_report(date, "trades", CRYPTO, "en")
+    # 1) Crypto channel — English, every crypto trade (carry resolved on the full sequence)
+    crypto_txt = build_report(date, "en", CRYPTO)
     chat = ADMIN_ID if to_admin_only else TARGET_CHAT
     r = tg("sendMessage", chat_id=chat, text=crypto_txt, parse_mode="HTML",
            disable_web_page_preview=True)
+    if not r.get("ok"):
+        # surface WHY it didn't post (wrong TARGET_CHAT, bot not admin, HTML error...)
+        dm_admin(f"⚠️ Daily wrap did NOT post to the crypto channel.\n"
+                 f"TARGET_CHAT = {TARGET_CHAT}\nTelegram replied: {r}")
 
-    # 2) Nifty (India) channel — Hinglish, 5:30 crypto only; skip if empty
-    nifty_txt = build_report(date, "niftytrades", CRYPTO, "hi")
+    # 2) Nifty (India) channel — Hinglish, only the trades forwarded to India; their
+    #    carry verdicts still come from the full crypto sequence, so singles resolve.
+    try:
+        nifty_fields = set(rdb.hgetall(f"niftytrades:{date}").keys())
+    except Exception:
+        nifty_fields = set()
+    nifty_txt = build_report(date, "hi", CRYPTO, only_fields=nifty_fields)
     if nifty_txt and INDIA_CHAT and india_on():
         nchat = ADMIN_ID if to_admin_only else INDIA_CHAT
-        tg("sendMessage", chat_id=nchat, text=nifty_txt, parse_mode="HTML",
-           disable_web_page_preview=True)
+        r2 = tg("sendMessage", chat_id=nchat, text=nifty_txt, parse_mode="HTML",
+                disable_web_page_preview=True)
+        if not r2.get("ok"):
+            dm_admin(f"⚠️ Daily wrap did NOT post to the India channel.\n"
+                     f"INDIA_CHAT = {INDIA_CHAT}\nTelegram replied: {r2}")
 
-    if r.get("ok") and not to_admin_only:
+    if not to_admin_only:
+        # set regardless of success, so a failed send never spam-retries every 45s
         try:
             rdb.set("report:lastdate", date)
         except Exception as e:
@@ -636,7 +684,7 @@ def on_boot():
     start_scheduler()
     total = sum(1 for k in ORDER for i in range(4) if slot_on(k, i))
     india = f"ON (slot {INDIA_SLOT_IDX+1})" if INDIA_CHAT else "OFF"
-    dm_admin(f"Relay v8 online (TP1=win · SL=loss · {EXPIRE_SEC//3600}h expiry · wrap @ {REPORT_TIME} IST).\n"
+    dm_admin(f"Relay v9 online (TP1=win · SL=loss · carry-forward wrap @ {REPORT_TIME} IST).\n"
              f"Trades ON: {total}/20\n"
              f"Freshness: {'ON' if window_on() else 'OFF'} ({WINDOW_MIN} min)\n"
              f"India group: {india}\n"
